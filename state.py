@@ -124,7 +124,13 @@ class KSPState(EnvBase):
           if (self._step_count > 10
               and obs[0].item() < 0.01
               and abs(obs[4].item()) < 0.01):
-            return False
+              return False
+          elif (self._step_count > 20
+                   and obs[2].item() < 0.9
+                   and obs[4].item() < -0.05
+                   and obs[0].item() > 0.1):
+              return False
+          return True
       except Exception:
         return False
         
@@ -148,7 +154,6 @@ class KSPState(EnvBase):
             self.space_center.quickload()
             time.sleep(4.0)
             self.vessel = self._wait_for_vessel()
-            self.vessel = self.space_center.active_vessel
             self.body = self.vessel.orbit.body
             self._initial_fuel = self._get_fuel_max()
 
@@ -220,23 +225,20 @@ class KSPState(EnvBase):
             },
             batch_size=[],
         )
+    
+    def _potential(self, obs):
+        apo = min(max(obs[1].item(), 0.0), 1.0)
+        peri = min(max(obs[2].item(), 0.0), 1.0)
+
+        return apo + peri
 
     def _reward_function(self, prev_obs, current_obs, intact) -> float:
         if not intact:
-            return -10.0
+            return -1.0
 
-        d_apoapsis = current_obs[1].item() - prev_obs[1].item()
-        d_periapsis = current_obs[2].item() - prev_obs[2].item()
+        reward = self._potential(current_obs) - self._potential(prev_obs)
 
-        reward = d_apoapsis + (d_periapsis * 2.0) - 0.01
-
-        # Milestone: apoapsis reached target
-        if current_obs[1].item() >= 1.0 and prev_obs[1].item() < 1.0:
-            reward += 5.0
-
-        # Milestone: periapsis reached target (orbit!)
-        if current_obs[2].item() >= 1.0 and prev_obs[2].item() < 1.0:
-            reward += 20.0
+       
 
         return reward
 
