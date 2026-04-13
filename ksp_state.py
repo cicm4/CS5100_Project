@@ -3,6 +3,7 @@ from asyncio import timeout
 import torch
 import math
 import time
+import socket
 import krpc
 from tensordict import TensorDict
 from torchrl.envs import EnvBase
@@ -20,6 +21,12 @@ class KSPState(EnvBase):
         self._step_count = 0
         self._prev_obs = None
         self._orbit_achieved = False
+        self._seed = None
+        self._episode_start_ut = None
+        self._episode_max_altitude = 0.0
+        self._episode_max_speed = 0.0
+        self._last_step_info = {}
+        self._last_termination_reason = ""
 
         n_observations = 10
 
@@ -71,8 +78,17 @@ class KSPState(EnvBase):
         )
 
     def _connect(self):
-        """Connect to KSP, cache body parameters, quicksave initial state."""
-        self.conn = krpc.connect(name=self.connection_name)
+        #Connect to KSP, cache body parameters, quicksave initial state.
+        try:
+            self.conn = krpc.connect(name=self.connection_name)
+        except ConnectionRefusedError as exc:
+            raise RuntimeError(
+                "Could not connect to kRPC."
+            ) from exc
+        except socket.error as exc:
+            raise RuntimeError(
+                "kRPC connection error"
+            ) from exc
         self.space_center = self.conn.space_center
         self.vessel = self.space_center.active_vessel
         self.body = self.vessel.orbit.body
@@ -118,6 +134,32 @@ class KSPState(EnvBase):
             min(orbit.time_to_apoapsis / 120.0, 2.0),
         ], dtype=torch.float32)
 
+    def _get_vehicle_metrics(self) -> dict:
+        metrics = {
+            "fuel_remaining": math.nan,
+            "fuel_remaining_frac": math.nan,
+            "apoapsis": math.nan,
+            "periapsis": math.nan,
+            "altitude": math.nan,
+            "speed": math.nan,
+        }
+        try:
+            flight = self.vessel.flight(self.body.reference_frame)
+            orbit = self.vessel.orbit
+            metrics.update(
+                {
+                    "fuel_remaining": float(self.vessel.resources.amount("LiquidFuel")),
+                    "fuel_remaining_frac": float(self._get_fuel_frac()),
+                    "apoapsis": float(orbit.apoapsis_altitude),
+                    "periapsis": float(orbit.periapsis_altitude),
+                    "altitude": float(flight.mean_altitude),
+                    "speed": float(orbit.speed),
+                }
+            )
+        except Exception:
+            pass
+        return metrics
+
     def _vessel_intact(self) -> bool:
       try:
           return len(self.vessel.parts.all) > 5
@@ -161,6 +203,11 @@ class KSPState(EnvBase):
         time.sleep(1.0)
         self._step_count = 0
         self._orbit_achieved = False
+        self._episode_start_ut = self.space_center.ut
+        self._episode_max_altitude = 0.0
+        self._episode_max_speed = 0.0
+        self._last_termination_reason = ""
+        self._last_step_info = {}
         self._prev_obs = self._get_obs()
 
         return TensorDict(
@@ -172,6 +219,62 @@ class KSPState(EnvBase):
             },
             batch_size=[],
         )
+
+    def _reward_breakdown(self, prev_obs, current_obs, intact) -> tuple[float, dict]:
+        components = {
+            "reward_potential": 0.0,
+            "reward_alive": 0.0,
+            "reward_overshoot": 0.0,
+            "reward_orbit_bonus": 0.0,
+            "reward_failure_penalty": 0.0,
+            "reward_ground_penalty": 0.0,
+        }
+
+        if not intact:
+            components["reward_failure_penalty"] = -5.0
+            return -5.0, components
+
+        components["reward_potential"] = (
+            self._potential(current_obs) - self._potential(prev_obs)
+        )
+        components["reward_alive"] = 0.01
+
+        if current_obs[1].item() >= 1.25:
+            components["reward_overshoot"] = -0.01
+
+        if self._orbit_achieved:
+            components["reward_orbit_bonus"] = 50.0
+
+        reward = sum(components.values())
+        return reward, components
+
+    def _build_step_info(
+        self,
+        reward: float,
+        reward_components: dict,
+        metrics: dict,
+        terminated: bool,
+        truncated: bool,
+        termination_reason: str,
+    ) -> dict:
+        orbit_time_s = math.nan
+        if self._orbit_achieved and self._episode_start_ut is not None:
+            orbit_time_s = float(self.space_center.ut - self._episode_start_ut)
+
+        step_info = {
+            "step_in_episode": int(self._step_count),
+            "success": bool(self._orbit_achieved),
+            "orbit_time_s": orbit_time_s,
+            "reward_total": float(reward),
+            "termination_reason": termination_reason,
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "max_altitude": float(self._episode_max_altitude),
+            "max_speed": float(self._episode_max_speed),
+        }
+        step_info.update(reward_components)
+        step_info.update(metrics)
+        return step_info
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
         action = tensordict['action']
@@ -194,26 +297,58 @@ class KSPState(EnvBase):
         self._step_count += 1
 
         intact = self._vessel_intact()
+        termination_reason = ""
 
         if intact:
             current_obs = self._get_obs()
+            metrics = self._get_vehicle_metrics()
         else:
             current_obs = torch.zeros(10, dtype=torch.float32)
+            metrics = self._get_vehicle_metrics()
 
-        reward = self._reward_function(self._prev_obs, current_obs, intact)
+        altitude = metrics.get("altitude", math.nan)
+        speed = metrics.get("speed", math.nan)
+        if math.isfinite(altitude):
+            self._episode_max_altitude = max(self._episode_max_altitude, altitude)
+        if math.isfinite(speed):
+            self._episode_max_speed = max(self._episode_max_speed, speed)
+
+        reward, reward_components = self._reward_breakdown(
+            self._prev_obs, current_obs, intact
+        )
 
         terminated = not intact
         truncated = self._step_count >= self.max_steps
+        if terminated:
+            termination_reason = "vessel_destroyed"
+        elif truncated:
+            termination_reason = "max_steps"
 
         if intact and current_obs[2].item() >= 1.0 and current_obs[1].item() >= 1.0:
             terminated = True
             self._orbit_achieved = True
+            termination_reason = "orbit_achieved"
+
+            reward, reward_components = self._reward_breakdown(
+                self._prev_obs, current_obs, intact
+            )
 
         if intact and current_obs[0].item() < 0.0 and self._step_count > 10:
             terminated = True
+            termination_reason = "below_ground"
+            reward_components["reward_ground_penalty"] = -10.0 - reward
             reward = -10.0
 
         self._prev_obs = current_obs
+        self._last_termination_reason = termination_reason
+        self._last_step_info = self._build_step_info(
+            reward=reward,
+            reward_components=reward_components,
+            metrics=metrics,
+            terminated=terminated,
+            truncated=truncated,
+            termination_reason=termination_reason,
+        )
 
         return TensorDict(
             {
@@ -233,22 +368,15 @@ class KSPState(EnvBase):
         return (10 * apo) + (20 * peri)
 
     def _reward_function(self, prev_obs, current_obs, intact) -> float:
-        if not intact:
-            return -5.0
-
-        reward = self._potential(current_obs) - self._potential(prev_obs)
-        reward += 0.01
-
-        if current_obs[1].item() >= 1.25:
-            reward -= 0.01
-
-        if self._orbit_achieved:
-            reward += 50.0
-
+        reward, _ = self._reward_breakdown(prev_obs, current_obs, intact)
         return reward
 
     def _set_seed(self, seed: int):
-        pass
+        self._seed = seed
+        torch.manual_seed(seed)
+
+    def get_step_info(self) -> dict:
+        return dict(self._last_step_info)
 
     def close(self):
         if hasattr(self, 'conn') and self.conn:
