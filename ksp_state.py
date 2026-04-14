@@ -26,6 +26,7 @@ class KSPState(EnvBase):
         self._episode_max_speed = 0.0
         self._last_step_info = {}
         self._last_termination_reason = ""
+        self._passed_apoapsis = False
 
         n_observations = 10
 
@@ -136,6 +137,7 @@ class KSPState(EnvBase):
             "surface_altitude": math.nan,
             "speed": math.nan,
             "vertical_speed": math.nan,
+            "time_to_apoapsis": math.nan,
             "situation": "",
         }
         try:
@@ -151,6 +153,7 @@ class KSPState(EnvBase):
                     "surface_altitude": float(flight.surface_altitude),
                     "speed": float(orbit.speed),
                     "vertical_speed": float(flight.vertical_speed),
+                    "time_to_apoapsis": float(orbit.time_to_apoapsis),
                     "situation": str(self.vessel.situation).lower(),
                 }
             )
@@ -195,6 +198,7 @@ class KSPState(EnvBase):
         self._episode_max_altitude = 0.0
         self._episode_max_speed = 0.0
         self._last_termination_reason = ""
+        self._passed_apoapsis = False
         self._last_step_info = {}
         self._prev_obs = self._get_obs()
 
@@ -220,11 +224,19 @@ class KSPState(EnvBase):
         }
 
         if not intact:
-            components["reward_failure_penalty"] = -40.0
-            return -40.0, components
+            components["reward_failure_penalty"] = -400.0
+            return -400.0, components
+
+        prev_potential_obs = prev_obs
+        if self._passed_apoapsis:
+            current_apo = current_obs[1].item()
+            prev_apo = prev_obs[1].item()
+            if current_apo < prev_apo:
+                prev_potential_obs = prev_obs.clone()
+                prev_potential_obs[1] = current_obs[1]
 
         components["reward_potential"] = (
-            self._potential(current_obs) - self._potential(prev_obs)
+            self._potential(current_obs) - self._potential(prev_potential_obs)
         )
         # Keep this tiny so the agent prefers progress, not mere survival.
         components["reward_alive"] = 0.001
@@ -253,6 +265,24 @@ class KSPState(EnvBase):
 
         reward = sum(components.values())
         return reward, components
+
+    def _update_passed_apoapsis_state(self, metrics: dict) -> None:
+        if self._passed_apoapsis or not self._last_step_info:
+            return
+
+        prev_tta = self._last_step_info.get("time_to_apoapsis", math.nan)
+        curr_tta = metrics.get("time_to_apoapsis", math.nan)
+        if not math.isfinite(prev_tta) or not math.isfinite(curr_tta):
+            return
+
+        # In a closed orbit, time_to_apoapsis counts down toward zero and then
+        # wraps to nearly an orbital period immediately after apoapsis.
+        wrapped_after_apoapsis = (
+            prev_tta <= max(5.0, 2.0 * self.step_interval)
+            and curr_tta > prev_tta + max(5.0, 4.0 * self.step_interval)
+        )
+        if wrapped_after_apoapsis:
+            self._passed_apoapsis = True
 
     def _build_step_info(
         self,
@@ -335,6 +365,7 @@ class KSPState(EnvBase):
             self._episode_max_altitude = max(self._episode_max_altitude, altitude)
         if math.isfinite(speed):
             self._episode_max_speed = max(self._episode_max_speed, speed)
+        self._update_passed_apoapsis_state(metrics)
 
         reward, reward_components = self._reward_breakdown(
             self._prev_obs, current_obs, intact

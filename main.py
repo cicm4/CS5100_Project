@@ -17,7 +17,7 @@ N_OBS = 10
 N_ACTIONS = 3
 HIDDEN = 256
 DEFAULT_DATA_DIR = Path("data")
-DEFAULT_CHECKPOINT_NAME = "checkpoint_latest.pt"
+DEFAULT_CHECKPOINT_NAME = "checkpoint_ep250.pt"
 
 
 def get_device() -> torch.device:
@@ -166,8 +166,9 @@ def run_use_scenario(
 
     while True:
         td_device = td.to(device)
-        # Use the deterministic policy path for deployment.
-        with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
+        # TanhNormal does not expose an analytical mode; deterministic sampling
+        # is the correct evaluation path here.
+        with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
             td_device = actor(td_device)
 
         td["action"] = td_device["action"].cpu()
